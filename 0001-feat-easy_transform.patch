@@ -1,0 +1,241 @@
+From cd14386972883d43c30db9715682155166c0ce39 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E4=B9=90=E5=A4=9A?= <yangsai@cai-inc.com>
+Date: Thu, 6 Apr 2023 21:30:17 +0800
+Subject: [PATCH] =?UTF-8?q?feat:=20=20=E6=B7=BB=E5=8A=A0easy=5Ftransform?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../lib/src/build_system/targets/common.dart  | 85 ++++++++++++++++++-
+ packages/flutter_tools/lib/src/compile.dart   |  7 +-
+ packages/flutter_tools/lib/src/run_hot.dart   | 17 +++-
+ packages/flutter_tools/pubspec.yaml           |  4 +
+ 4 files changed, 107 insertions(+), 6 deletions(-)
+
+diff --git a/packages/flutter_tools/lib/src/build_system/targets/common.dart b/packages/flutter_tools/lib/src/build_system/targets/common.dart
+index c0e78b7398..8569205ec3 100644
+--- a/packages/flutter_tools/lib/src/build_system/targets/common.dart
++++ b/packages/flutter_tools/lib/src/build_system/targets/common.dart
+@@ -2,15 +2,17 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++import 'package:easy_transform/easy_transform.dart';
+ import 'package:package_config/package_config.dart';
+ 
+ import '../../artifacts.dart';
+ import '../../base/build.dart';
+ import '../../base/file_system.dart';
+ import '../../build_info.dart';
++import '../../cache.dart';
+ import '../../compile.dart';
+ import '../../dart/package_map.dart';
+-import '../../globals.dart' as globals show xcode;
++import '../../globals.dart' as globals show xcode, artifacts;
+ import '../build_system.dart';
+ import '../depfile.dart';
+ import '../exceptions.dart';
+@@ -148,6 +150,79 @@ class KernelSnapshot extends Target {
+ 
+   @override
+   Future<void> build(Environment environment) async {
++    final String? buildModeEnvironment = environment.defines[kBuildMode];
++    if (buildModeEnvironment == null) {
++      throw MissingDefineException(kBuildMode, 'kernel_snapshot');
++    }
++    final String? targetPlatformEnvironment = environment.defines[kTargetPlatform];
++    if (targetPlatformEnvironment == null) {
++      throw MissingDefineException(kTargetPlatform, 'kernel_snapshot');
++    }
++    final BuildMode buildMode = getBuildModeForName(buildModeEnvironment);
++
++    if (buildMode.isPrecompiled) {
++      final int time1 = DateTime.now().millisecondsSinceEpoch;
++      /// 重新处理 dill
++      if (await EasyTransform.enableEasyTransform(environment.projectDir.path)) {
++        await buildImp(environment);
++        final int time2 = DateTime.now().millisecondsSinceEpoch;
++        print('first build time: ${time2 - time1}');
++        final bool result = await EasyTransform.run(CommandArgTransformModel(
++            rootBuildDir: environment.rootBuildDir.path,
++            projectDir: environment.projectDir.path,
++            engineDartBinaryPath: globals.artifacts?.getHostArtifact(HostArtifact.engineDartBinary).dirname ?? '',
++            targetFile: environment.defines[kTargetFile] ?? '',
++            dillPath:  environment.buildDir.childFile('app.dill').path,
++            flutterRoot: Cache.flutterRoot ?? ''
++        ));
++
++        final int time3 = DateTime.now().millisecondsSinceEpoch;
++
++        print('EasyTransform build time: ${time3 - time2}');
++
++        if (!result) {
++          print('EasyTransform -- 失败');
++        }
++      }
++
++      final int time3 = DateTime.now().millisecondsSinceEpoch;
++
++      final String dillPath = environment.buildDir.childFile('app.dill').path;
++      /// 重新编译
++      await buildImp(environment, fromDill: dillPath);
++      final int time4 = DateTime.now().millisecondsSinceEpoch;
++      print('last build time: ${time4 - time3}');
++
++      print('all build time: ${time4 - time1}');
++
++    }else {
++      final int time1 = DateTime.now().millisecondsSinceEpoch;
++      await buildImp(environment);
++      final int time2 = DateTime.now().millisecondsSinceEpoch;
++      print('debug first build time: ${time2 - time1}');
++      /// 重新处理 dill
++      if (await EasyTransform.enableEasyTransform(environment.projectDir.path)) {
++        final bool result = await EasyTransform.run(CommandArgTransformModel(
++            rootBuildDir: environment.rootBuildDir.path,
++            projectDir: environment.projectDir.path,
++            engineDartBinaryPath: globals.artifacts?.getHostArtifact(HostArtifact.engineDartBinary).dirname ?? '',
++            targetFile: environment.defines[kTargetFile] ?? '',
++            dillPath:  environment.buildDir.childFile('app.dill').path,
++            flutterRoot: Cache.flutterRoot ?? ''
++        ));
++        final int time3 = DateTime.now().millisecondsSinceEpoch;
++        print('debug EasyTransform build time: ${time3 - time2}');
++        print('all EasyTransform time: ${time3 - time1}');
++        if (!result) {
++          print('debug EasyTransform -- 失败');
++        }
++      }
++    }
++
++
++  }
++
++  Future<CompilerOutput> buildImp(Environment environment, {String? fromDill}) async {
+     final KernelCompiler compiler = KernelCompiler(
+       fileSystem: environment.fileSystem,
+       logger: environment.logger,
+@@ -166,8 +241,8 @@ class KernelSnapshot extends Target {
+     final BuildMode buildMode = getBuildModeForName(buildModeEnvironment);
+     final String targetFile = environment.defines[kTargetFile] ?? environment.fileSystem.path.join('lib', 'main.dart');
+     final File packagesFile = environment.projectDir
+-      .childDirectory('.dart_tool')
+-      .childFile('package_config.json');
++        .childDirectory('.dart_tool')
++        .childFile('package_config.json');
+     final String targetFileAbsolute = environment.fileSystem.file(targetFile).absolute.path;
+     // everything besides 'false' is considered to be enabled.
+     final bool trackWidgetCreation = environment.defines[kTrackWidgetCreation] != 'false';
+@@ -220,7 +295,8 @@ class KernelSnapshot extends Target {
+         platform: targetPlatform,
+         mode: buildMode,
+       ),
+-      aot: buildMode.isPrecompiled,
++      aot: buildMode.isPrecompiled && fromDill != null,
++      fromDill: fromDill,
+       buildMode: buildMode,
+       trackWidgetCreation: trackWidgetCreation && buildMode != BuildMode.release,
+       targetModel: targetModel,
+@@ -240,6 +316,7 @@ class KernelSnapshot extends Target {
+     if (output == null || output.errorCount != 0) {
+       throw Exception();
+     }
++    return output;
+   }
+ }
+ 
+diff --git a/packages/flutter_tools/lib/src/compile.dart b/packages/flutter_tools/lib/src/compile.dart
+index 1198d344e4..b66345c81c 100644
+--- a/packages/flutter_tools/lib/src/compile.dart
++++ b/packages/flutter_tools/lib/src/compile.dart
+@@ -221,6 +221,7 @@ class KernelCompiler {
+ 
+   Future<CompilerOutput?> compile({
+     required String sdkRoot,
++    String? fromDill,
+     String? mainPath,
+     String? outputFilePath,
+     String? depFilePath,
+@@ -297,6 +298,9 @@ class KernelCompiler {
+         '--depfile',
+         depFilePath,
+       ],
++      if (fromDill != null) ... <String>[
++        '--from-dill', fromDill
++      ],
+       if (fileSystemRoots != null)
+         for (final String root in fileSystemRoots) ...<String>[
+           '--filesystem-root',
+@@ -324,7 +328,7 @@ class KernelCompiler {
+       ...?extraFrontEndOptions,
+       mainUri,
+     ];
+-
++    print("complant: " + command.join(' '));
+     _logger.printTrace(command.join(' '));
+     final Process server = await _processManager.start(command);
+ 
+@@ -789,6 +793,7 @@ class DefaultResidentCompiler implements ResidentCompiler {
+       if (unsafePackageSerialization == true) '--unsafe-package-serialization',
+       ...?extraFrontEndOptions,
+     ];
++    print('hot-${command.join(' ')}');
+     _logger.printTrace(command.join(' '));
+     _server = await _processManager.start(command);
+     _server?.stdout
+diff --git a/packages/flutter_tools/lib/src/run_hot.dart b/packages/flutter_tools/lib/src/run_hot.dart
+index 6351f430de..785ac87fd8 100644
+--- a/packages/flutter_tools/lib/src/run_hot.dart
++++ b/packages/flutter_tools/lib/src/run_hot.dart
+@@ -6,6 +6,10 @@
+ 
+ import 'dart:async';
+ 
++import 'package:easy_transform/common/easy_transform.dart';
++import 'package:easy_transform/easy_transform.dart';
++import 'package:flutter_tools/src/artifacts.dart';
++import 'package:flutter_tools/src/cache.dart';
+ import 'package:meta/meta.dart';
+ import 'package:package_config/package_config.dart';
+ import 'package:pool/pool.dart';
+@@ -419,9 +423,20 @@ class HotRunner extends ResidentRunner {
+       compileTimeInMs: totalCompileTime.inMilliseconds,
+       transferTimeInMs: totalLaunchAppTime.inMilliseconds,
+     )?.send()));
+-
+     try {
+       final List<bool> results = await Future.wait(startupTasks);
++      /// 自定义 dill 转换
++      print('hot results');
++      if (await EasyTransform.enableEasyTransform(FlutterProject.current().directory.path)) {
++        final String rootBuildPath = FlutterProject.current().directory.childDirectory('.dart_tool').childDirectory('flutter_build').path;
++        await EasyTransform.run(
++            CommandArgTransformCopyDillModel(
++                outputDill: dillOutputPath,
++                rootBuildDir: rootBuildPath
++            )
++        );
++        print('copy complate inputFile.path');
++      }
+       if (!results.every((bool passed) => passed)) {
+         appFailedToStart();
+         return 1;
+diff --git a/packages/flutter_tools/pubspec.yaml b/packages/flutter_tools/pubspec.yaml
+index 831a824f1f..e73beb6095 100644
+--- a/packages/flutter_tools/pubspec.yaml
++++ b/packages/flutter_tools/pubspec.yaml
+@@ -89,6 +89,10 @@ dependencies:
+   term_glyph: 1.2.0 # THIS LINE IS AUTOGENERATED - TO UPDATE USE "flutter update-packages --force-upgrade"
+   typed_data: 1.3.0 # THIS LINE IS AUTOGENERATED - TO UPDATE USE "flutter update-packages --force-upgrade"
+   watcher: 1.0.1 # THIS LINE IS AUTOGENERATED - TO UPDATE USE "flutter update-packages --force-upgrade"
++  easy_transform:
++    git:
++      url: git@git.cai-inc.com:f2e-cube/flutter/easy_transform.git
++      ref: develop
+ 
+ dev_dependencies:
+   collection: 1.16.0
+-- 
+2.32.0 (Apple Git-132)
+
